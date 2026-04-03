@@ -136,7 +136,7 @@ def allowed_file(filename: str) -> bool:
 def save_patient_file_record(patient_id, uploaded_file, category, title):
     if not uploaded_file or not uploaded_file.filename:
         return False
-
+    
     if not allowed_file(uploaded_file.filename):
         return False
 
@@ -162,6 +162,11 @@ def save_patient_file_record(patient_id, uploaded_file, category, title):
     db.session.add(patient_file)
     db.session.commit()
     return True
+    
+def get_patient_file_url(patient_file):
+    if not patient_file:
+        return None
+    return url_for('serve_patient_file', filename=patient_file.stored_filename)
 
 def normalize_uploaded_files(*field_names: str):
     files = []
@@ -193,13 +198,6 @@ def get_remote_file_url(patient_file):
             secure=True,
         )[0]
     return None
-
-
-def get_patient_file_url(patient_file):
-    remote_url = get_remote_file_url(patient_file)
-    if remote_url:
-        return remote_url
-    return url_for('serve_patient_file', filename=patient_file.stored_filename)
 
 
 def save_uploaded_files(patient_id: int, uploaded_files, category: str, title: str):
