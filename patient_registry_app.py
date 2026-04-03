@@ -1,9 +1,14 @@
 import os
 from datetime import datetime
-from uuid import uuid4
 from functools import wraps
 
 from flask import Flask, request, redirect, url_for, render_template_string, flash, session, send_from_directory
+
+try:
+    import cloudinary
+    import cloudinary.uploader
+except ImportError:
+    cloudinary = None
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.utils import secure_filename
 
@@ -28,6 +33,21 @@ APP_USERNAME = os.environ.get('APP_USERNAME', 'admin')
 APP_PASSWORD = os.environ.get('APP_PASSWORD', '1234')
 STATUS_VALUES = ['Aktiv', 'Kontrol', 'Bitmiş', 'Arxiv']
 SOURCE_VALUES = ['Instagram', 'TikTok', 'Google', 'Digər']
+
+CLOUDINARY_CLOUD_NAME = os.environ.get('CLOUDINARY_CLOUD_NAME', '').strip()
+CLOUDINARY_API_KEY = os.environ.get('CLOUDINARY_API_KEY', '').strip()
+CLOUDINARY_API_SECRET = os.environ.get('CLOUDINARY_API_SECRET', '').strip()
+CLOUDINARY_ENABLED = bool(
+    cloudinary and CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET
+)
+
+if CLOUDINARY_ENABLED:
+    cloudinary.config(
+        cloud_name=CLOUDINARY_CLOUD_NAME,
+        api_key=CLOUDINARY_API_KEY,
+        api_secret=CLOUDINARY_API_SECRET,
+        secure=True,
+    )
 
 
 class Patient(db.Model):
@@ -113,29 +133,75 @@ def parse_date(value: str):
 def allowed_file(filename: str) -> bool:
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+def normalize_uploaded_files(*field_names: str):
+    files = []
+    for field_name in field_names:
+        for item in request.files.getlist(field_name):
+            if item and item.filename:
+                files.append(item)
+    return files
 
-def normalize_uploaded_files(field_name: str):
-    return [item for item in request.files.getlist(field_name) if item and item.filename and item.filename.strip()]
+
+def get_file_resource_type(file_ext: str) -> str:
+    return 'image' if file_ext in {'jpg', 'jpeg', 'png', 'webp'} else 'raw'
 
 
-def save_patient_files(patient_id: int, uploaded_files, category: str = '', title: str = '') -> int:
-    valid_files = [item for item in (uploaded_files or []) if item and item.filename and item.filename.strip()]
-    if not valid_files:
-        return 0
+def build_local_stored_filename(patient_id: int, safe_name: str) -> str:
+    return f"{patient_id}_{int(datetime.utcnow().timestamp() * 1000)}_{safe_name}"
 
+
+def get_remote_file_url(patient_file):
+    if not patient_file.stored_filename:
+        return None
+    if patient_file.stored_filename.startswith('http://') or patient_file.stored_filename.startswith('https://'):
+        return patient_file.stored_filename
+    if CLOUDINARY_ENABLED:
+        resource_type = get_file_resource_type((patient_file.file_ext or '').lower())
+        return cloudinary.utils.cloudinary_url(
+            patient_file.stored_filename,
+            resource_type=resource_type,
+            secure=True,
+        )[0]
+    return None
+
+
+def get_patient_file_url(patient_file):
+    remote_url = get_remote_file_url(patient_file)
+    if remote_url:
+        return remote_url
+    return url_for('serve_patient_file', filename=patient_file.stored_filename)
+
+
+def save_uploaded_files(patient_id: int, uploaded_files, category: str, title: str):
     saved_count = 0
-    for uploaded_file in valid_files:
-        if not allowed_file(uploaded_file.filename):
-            raise ValueError(f'Dəstəklənməyən fayl formatı: {uploaded_file.filename}')
+    for uploaded in uploaded_files:
+        original_filename = uploaded.filename or ''
+        if not original_filename:
+            continue
+        if not allowed_file(original_filename):
+            continue
 
-        original_filename = os.path.basename(uploaded_file.filename)
         safe_name = secure_filename(original_filename)
-        if not safe_name:
-            safe_name = f'file_{uuid4().hex}'
+        if not safe_name or '.' not in safe_name:
+            continue
         ext = safe_name.rsplit('.', 1)[1].lower()
-        stored_filename = f"{patient_id}_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{uuid4().hex}_{safe_name}"
-        save_path = os.path.join(app.config['UPLOAD_FOLDER'], stored_filename)
-        uploaded_file.save(save_path)
+        resource_type = get_file_resource_type(ext)
+
+        if CLOUDINARY_ENABLED:
+            upload_result = cloudinary.uploader.upload(
+                uploaded,
+                resource_type=resource_type,
+                folder=f'patient_files/{patient_id}',
+                public_id=os.path.splitext(safe_name)[0],
+                unique_filename=True,
+                overwrite=False,
+                use_filename=True,
+            )
+            stored_filename = upload_result.get('public_id') or ''
+        else:
+            stored_filename = build_local_stored_filename(patient_id, safe_name)
+            save_path = os.path.join(app.config['UPLOAD_FOLDER'], stored_filename)
+            uploaded.save(save_path)
 
         patient_file = PatientFile(
             patient_id=patient_id,
@@ -147,8 +213,24 @@ def save_patient_files(patient_id: int, uploaded_files, category: str = '', titl
         )
         db.session.add(patient_file)
         saved_count += 1
-
     return saved_count
+
+
+def delete_uploaded_file(patient_file):
+    if not patient_file.stored_filename:
+        return
+
+    remote_url = get_remote_file_url(patient_file)
+    if remote_url and CLOUDINARY_ENABLED:
+        resource_type = get_file_resource_type((patient_file.file_ext or '').lower())
+        cloudinary.uploader.destroy(
+            patient_file.stored_filename,
+            resource_type=resource_type,
+            invalidate=True,
+        )
+        return
+
+    delete_uploaded_file(patient_file)
 
 
 BASE_HTML = """
@@ -551,10 +633,19 @@ PATIENT_FORM_BODY = """
       <textarea name="notes">{{ patient.notes if patient else '' }}</textarea>
     </div>
 
-    {% if not patient %}
-    <div class="card" style="padding:12px; margin:12px 0;">
+    <div class="field">
+      <label>Status</label>
+      <select name="status">
+        {% for item in statuses %}
+          <option value="{{ item }}" {% if patient and patient.status == item %}selected{% elif not patient and item == 'Aktiv' %}selected{% endif %}>{{ item }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="card" style="padding:12px; margin-top:12px;">
       <h3>İlkin görüntü / fayl</h3>
-      <p class="muted">Xəstə ilk dəfə əlavə olunanda MRT, rentgen, PDF və ya DICOM faylı da yükləyə bilərsən.</p>
+      <p class="muted">Xəstəni ilk dəfə əlavə edərkən tək fayl, çoxlu fayl və ya MRT qovluğu yükləyə bilərsən.</p>
+
       <div class="grid-3">
         <div class="field">
           <label>Kateqoriya</label>
@@ -565,25 +656,22 @@ PATIENT_FORM_BODY = """
             {% endfor %}
           </select>
         </div>
+
         <div class="field">
           <label>Başlıq</label>
           <input type="text" name="initial_file_title" placeholder="Məsələn: Servikal MRT, Lomber rentgen">
         </div>
+
         <div class="field">
-          <label>Fayl seç</label>
-          <input type="file" name="initial_file" accept=".jpg,.jpeg,.png,.webp,.pdf,.dcm,.dicom">
+          <label>Çoxlu fayl seç</label>
+          <input type="file" name="initial_files" accept=".jpg,.jpeg,.png,.webp,.pdf,.dcm,.dicom" multiple>
         </div>
       </div>
-    </div>
-    {% endif %}
 
-    <div class="field">
-      <label>Status</label>
-      <select name="status">
-        {% for item in statuses %}
-          <option value="{{ item }}" {% if patient and patient.status == item %}selected{% elif not patient and item == 'Aktiv' %}selected{% endif %}>{{ item }}</option>
-        {% endfor %}
-      </select>
+      <div class="field">
+        <label>MRT qovluğu seç</label>
+        <input type="file" name="initial_folder_files" accept=".jpg,.jpeg,.png,.webp,.pdf,.dcm,.dicom" webkitdirectory directory multiple>
+      </div>
     </div>
 
     <div class="actions">
@@ -654,7 +742,7 @@ VIEW_BODY = """
 
 <div class="card">
   <h2>Görüntülər / Fayllar</h2>
-  <p class="muted">Şəkil və PDF sistemdə açılır. DICOM faylı isə saxlanılır və yüklənə bilir. MRT üçün çoxlu .dcm faylını və ya bütöv qovluğu bir dəfəlik yükləyə bilərsən.</p>
+  <p class="muted">Şəkil, PDF və DICOM faylları Cloudinary üzərindən saxlanılır. Çoxlu .dcm və qovluq yükləmək mümkündür.</p>
   <form method="post" action="{{ url_for('upload_patient_file', patient_id=patient.id) }}" enctype="multipart/form-data">
     <div class="grid-3">
       <div class="field">
@@ -670,9 +758,13 @@ VIEW_BODY = """
         <input type="text" name="title" placeholder="Məsələn: Servikal MRT, Lomber rentgen">
       </div>
       <div class="field">
-        <label>Fayl və ya qovluq seç</label>
-        <input type="file" name="files" accept=".jpg,.jpeg,.png,.webp,.pdf,.dcm,.dicom" multiple webkitdirectory directory required>
-        <div class="small">MRT olduqda çoxlu .dcm və ya qovluq seçə bilərsən.</div>
+        <label>Fayl seç</label>
+        <input type="file" name="files" accept=".jpg,.jpeg,.png,.webp,.pdf,.dcm,.dicom" multiple>
+      </div>
+    </div>
+    <div class="field">
+      <label>MRT qovluğu seç</label>
+      <input type="file" name="folder_files" accept=".jpg,.jpeg,.png,.webp,.pdf,.dcm,.dicom" webkitdirectory directory multiple>
       </div>
     </div>
     <button class="btn" type="submit">Faylı yüklə</button>
@@ -688,20 +780,20 @@ VIEW_BODY = """
           <div class="muted">Tarix: {{ f.created_at.strftime('%Y-%m-%d %H:%M') }}</div>
           <div class="actions top-space">
             {% if f.file_ext in ['jpg', 'jpeg', 'png', 'webp', 'pdf'] %}
-              <a class="btn secondary" target="_blank" href="{{ url_for('serve_patient_file', filename=f.stored_filename) }}">Aç</a>
+              <a class="btn secondary" target="_blank" href="{{ get_patient_file_url(f) }}">Aç</a>
             {% endif %}
-            <a class="btn" target="_blank" href="{{ url_for('serve_patient_file', filename=f.stored_filename) }}">Yüklə</a>
+            <a class="btn" target="_blank" href="{{ get_patient_file_url(f) }}">Yüklə</a>
             <form method="post" action="{{ url_for('delete_patient_file', file_id=f.id) }}">
               <button class="btn danger" type="submit">Sil</button>
             </form>
           </div>
           {% if f.file_ext in ['jpg', 'jpeg', 'png', 'webp'] %}
             <div class="top-space">
-              <img src="{{ url_for('serve_patient_file', filename=f.stored_filename) }}" alt="{{ f.original_filename }}" style="max-width:100%; border-radius:12px; border:1px solid var(--line);">
+              <img src="{{ get_patient_file_url(f) }}" alt="{{ f.original_filename }}" style="max-width:100%; border-radius:12px; border:1px solid var(--line);">
             </div>
           {% elif f.file_ext == 'pdf' %}
             <div class="top-space">
-              <iframe src="{{ url_for('serve_patient_file', filename=f.stored_filename) }}" style="width:100%; min-height:500px; border:1px solid var(--line); border-radius:12px;"></iframe>
+              <iframe src="{{ get_patient_file_url(f) }}" style="width:100%; min-height:500px; border:1px solid var(--line); border-radius:12px;"></iframe>
             </div>
           {% else %}
             <p class="muted top-space">Bu fayl DICOM formatındadır. Sistem onu saxlayır, yükləyə bilir, amma daxildə önizləmə göstərmir.</p>
@@ -781,7 +873,7 @@ SESSION_FORM_BODY = """
 
 def render_page(title: str, body_template: str, **context):
     body = render_template_string(body_template, **context)
-    return render_template_string(BASE_HTML, title=title, body=body)
+    return render_template_string(BASE_HTML, title=title, body=body, get_patient_file_url=get_patient_file_url)
 
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -889,22 +981,15 @@ def new_patient():
         db.session.add(patient)
         db.session.commit()
 
-        uploaded_files = normalize_uploaded_files('initial_files')
+        uploaded_files = normalize_uploaded_files('initial_files', 'initial_folder_files')
         category = request.form.get('initial_file_category', '').strip()
         title = request.form.get('initial_file_title', '').strip()
-
-        try:
-            saved_count = save_patient_files(patient.id, uploaded_files, category, title)
-            if saved_count:
-                db.session.commit()
-                flash(f'Xəstə və {saved_count} ilkin fayl uğurla əlavə olundu.')
-            else:
-                flash('Xəstə uğurla əlavə olundu.')
-        except ValueError as exc:
-            db.session.rollback()
-            flash(str(exc))
-            flash('Xəstə əlavə olundu, amma ilkin fayllar yüklənmədi.')
-
+        saved_count = save_uploaded_files(patient.id, uploaded_files, category, title)
+        if saved_count:
+            db.session.commit()
+            flash(f'Xəstə və {saved_count} fayl uğurla əlavə olundu.')
+        else:
+            flash('Xəstə uğurla əlavə olundu.')
         return redirect(url_for('view_patient', patient_id=patient.id))
 
     return render_page(
@@ -916,6 +1001,7 @@ def new_patient():
         sources=SOURCE_VALUES,
         file_categories=FILE_CATEGORY_VALUES,
     )
+
 
 @app.route('/patients/<int:patient_id>')
 @login_required
@@ -992,27 +1078,47 @@ def new_session(patient_id):
 @login_required
 def upload_patient_file(patient_id):
     patient = Patient.query.filter_by(id=patient_id, is_deleted=False).first_or_404()
-    uploaded_files = normalize_uploaded_files('files')
+    uploaded = request.files.get('file')
     category = request.form.get('category', '').strip()
     title = request.form.get('title', '').strip()
 
-    if not uploaded_files:
+    if not uploaded or uploaded.filename == '':
         flash('Fayl seçilməyib.')
         return redirect(url_for('view_patient', patient_id=patient.id))
 
-    try:
-        saved_count = save_patient_files(patient.id, uploaded_files, category, title)
-        db.session.commit()
-        flash(f'{saved_count} fayl uğurla yükləndi.')
-    except ValueError as exc:
-        db.session.rollback()
-        flash(str(exc))
+    if not allowed_file(uploaded.filename):
+        flash('Bu fayl formatı dəstəklənmir.')
+        return redirect(url_for('view_patient', patient_id=patient.id))
 
+    original_filename = uploaded.filename
+    safe_name = secure_filename(original_filename)
+    ext = safe_name.rsplit('.', 1)[1].lower()
+    stored_filename = f"{patient.id}_{int(datetime.utcnow().timestamp())}_{safe_name}"
+    save_path = os.path.join(app.config['UPLOAD_FOLDER'], stored_filename)
+    uploaded.save(save_path)
+
+    patient_file = PatientFile(
+        patient_id=patient.id,
+        category=category or 'Digər sənəd',
+        title=title,
+        original_filename=original_filename,
+        stored_filename=stored_filename,
+        file_ext=ext,
+    )
+    db.session.add(patient_file)
+    db.session.commit()
+    flash('Fayl uğurla yükləndi.')
     return redirect(url_for('view_patient', patient_id=patient.id))
+
 
 @app.route('/uploads/<path:filename>')
 @login_required
 def serve_patient_file(filename):
+    patient_file = PatientFile.query.filter_by(stored_filename=filename).first()
+    if patient_file:
+        remote_url = get_remote_file_url(patient_file)
+        if remote_url:
+            return redirect(remote_url)
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 
@@ -1021,9 +1127,7 @@ def serve_patient_file(filename):
 def delete_patient_file(file_id):
     patient_file = PatientFile.query.get_or_404(file_id)
     patient_id = patient_file.patient_id
-    file_path = os.path.join(app.config['UPLOAD_FOLDER'], patient_file.stored_filename)
-    if os.path.exists(file_path):
-        os.remove(file_path)
+    delete_uploaded_file(patient_file)
     db.session.delete(patient_file)
     db.session.commit()
     flash('Fayl silindi.')
