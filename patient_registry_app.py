@@ -1076,40 +1076,38 @@ def new_session(patient_id):
 
 @app.route('/patients/<int:patient_id>/files/upload', methods=['POST'])
 @login_required
+
+@app.route('/patients/<int:patient_id>/files/upload', methods=['POST'])
+@login_required
 def upload_patient_file(patient_id):
     patient = Patient.query.filter_by(id=patient_id, is_deleted=False).first_or_404()
-    uploaded = request.files.get('file')
     category = request.form.get('category', '').strip()
     title = request.form.get('title', '').strip()
 
-    if not uploaded or uploaded.filename == '':
+    uploaded_files = normalize_uploaded_files('files', 'folder_files')
+
+    if not uploaded_files:
         flash('Fayl seçilməyib.')
         return redirect(url_for('view_patient', patient_id=patient.id))
 
-    if not allowed_file(uploaded.filename):
-        flash('Bu fayl formatı dəstəklənmir.')
-        return redirect(url_for('view_patient', patient_id=patient.id))
+    saved_count = 0
 
-    original_filename = uploaded.filename
-    safe_name = secure_filename(original_filename)
-    ext = safe_name.rsplit('.', 1)[1].lower()
-    stored_filename = f"{patient.id}_{int(datetime.utcnow().timestamp())}_{safe_name}"
-    save_path = os.path.join(app.config['UPLOAD_FOLDER'], stored_filename)
-    uploaded.save(save_path)
+    for uploaded in uploaded_files:
+        result = save_patient_file_record(
+            patient_id=patient.id,
+            uploaded_file=uploaded,
+            category=category or 'Digər sənəd',
+            title=title,
+        )
+        if result:
+            saved_count += 1
 
-    patient_file = PatientFile(
-        patient_id=patient.id,
-        category=category or 'Digər sənəd',
-        title=title,
-        original_filename=original_filename,
-        stored_filename=stored_filename,
-        file_ext=ext,
-    )
-    db.session.add(patient_file)
-    db.session.commit()
-    flash('Fayl uğurla yükləndi.')
+    if saved_count == 0:
+        flash('Uyğun fayl tapılmadı və ya yükləmə alınmadı.')
+    else:
+        flash(f'{saved_count} fayl uğurla yükləndi.')
+
     return redirect(url_for('view_patient', patient_id=patient.id))
-
 
 @app.route('/uploads/<path:filename>')
 @login_required
