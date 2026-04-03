@@ -1074,8 +1074,7 @@ def new_session(patient_id):
     )
 
 
-@app.route('/patients/<int:patient_id>/files/upload', methods=['POST'])
-@login_required
+
 
 @app.route('/patients/<int:patient_id>/files/upload', methods=['POST'])
 @login_required
