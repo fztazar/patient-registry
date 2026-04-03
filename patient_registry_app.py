@@ -133,6 +133,36 @@ def parse_date(value: str):
 def allowed_file(filename: str) -> bool:
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+def save_patient_file_record(patient_id, uploaded_file, category, title):
+    if not uploaded_file or not uploaded_file.filename:
+        return False
+
+    if not allowed_file(uploaded_file.filename):
+        return False
+
+    original_filename = uploaded_file.filename
+    safe_name = secure_filename(original_filename)
+
+    if '.' not in safe_name:
+        return False
+
+    ext = safe_name.rsplit('.', 1)[1].lower()
+    stored_filename = f"{patient_id}_{int(datetime.utcnow().timestamp())}_{safe_name}"
+    save_path = os.path.join(app.config['UPLOAD_FOLDER'], stored_filename)
+    uploaded_file.save(save_path)
+
+    patient_file = PatientFile(
+        patient_id=patient_id,
+        category=category or 'Digər sənəd',
+        title=title,
+        original_filename=original_filename,
+        stored_filename=stored_filename,
+        file_ext=ext,
+    )
+    db.session.add(patient_file)
+    db.session.commit()
+    return True
+
 def normalize_uploaded_files(*field_names: str):
     files = []
     for field_name in field_names:
